@@ -1,0 +1,16 @@
+Import spreadsheetkit
+
+Sub Main(args As Array Of String)
+    If Array.Count(args) <> 2 Then
+        Print "Usage: spreadsheets workbook.xlsx"
+        Return
+    End If
+    Dim workbook As XLSXWorkbook = ReadXLSX(args(1))
+    For Each sheet As XLSXSheet In workbook.Sheets
+        Print sheet.Name + ": " + String.From(sheet.CellCount) + " stored cells"
+        For Each cell As XLSXCell In sheet.Cells
+            Print String.From(cell.Row) + "," + String.From(cell.Column) + " " + cell.Kind + " " + cell.Text
+            If String.Len(cell.Formula) > 0 Then Print "  formula (not evaluated): " + cell.Formula
+        Next
+    Next
+End Sub

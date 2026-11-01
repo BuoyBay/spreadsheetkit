@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "dependencies": {
+    "spreadsheetkit": {
+      "git": "https://github.com/BuoyBay/spreadsheetkit.git",
+      "rev": "refs/heads/main"
+    }
+  }
+}

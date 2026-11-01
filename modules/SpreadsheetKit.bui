@@ -1,0 +1,426 @@
+Import zip.Zip
+Import xml.XML
+
+Const XLSXMain As String = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+Const XLSXRel As String = "http://schemas.openxmlformats.org/package/2006/relationships"
+Const XLSXOfficeRel As String = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+
+Private Function ExactXLSX(left As String, right As String) As Boolean
+    Return String.Compare(left, right, True) = 0
+End Function
+
+Private Sub XLSXRequire(passed As Boolean, message As String)
+    If Not passed Then Throw New InvalidArgumentException("XLSX: " + message)
+End Sub
+
+Private Function XLSXKey(inputText As String) As String
+    Return Bytes.FromString(inputText, Text.Encodings.UTF8).ToHex()
+End Function
+
+Private Function XLSXAttribute(node As XMLItem, name As String) As String
+    Return node.Attribute(name).Or("")
+End Function
+
+Private Function XLSXChild(node As XMLItem, name As String) As XMLItem
+    For i As Integer = 0 To node.Count() - 1
+        Dim item As XMLItem = node.ChildAt(i)
+        If item.IsElement() And ExactXLSX(item.Name(), name) And ExactXLSX(item.NamespaceURI(), XLSXMain) Then Return item
+    Next
+    Return New XMLItem()
+End Function
+
+Private Function XLSXRoot(document As XMLItem, name As String, namespaceUri As String) As XMLItem
+    For i As Integer = 0 To document.Count() - 1
+        Dim item As XMLItem = document.ChildAt(i)
+        If item.IsElement() Then
+            XLSXRequire(ExactXLSX(item.Name(), name) And ExactXLSX(item.NamespaceURI(), namespaceUri), "unexpected XML root or namespace")
+            Return item
+        End If
+    Next
+    Throw New InvalidArgumentException("XLSX: XML root missing")
+End Function
+
+Private Sub XLSXValidateRelationshipIDs(relationships As XMLItem)
+    Dim ids As New Map Of String, Boolean()
+    For i As Integer = 0 To relationships.Count() - 1
+        Dim item As XMLItem = relationships.ChildAt(i)
+        If Not item.IsElement() Then Continue For
+        If Not ExactXLSX(item.Name(), "Relationship") Or Not ExactXLSX(item.NamespaceURI(), XLSXRel) Then Continue For
+        Dim id As String = XLSXAttribute(item, "Id")
+        XLSXRequire(String.Len(id) > 0 And Not ids.ContainsKey(XLSXKey(id)), "duplicate/missing relationship ID")
+        ids.Set(XLSXKey(id), True)
+    Next
+End Sub
+
+Private Function XLSXUnsigned(text As String, maximum As Integer) As Integer
+    XLSXRequire(String.Len(text) > 0 And String.Len(text) <= 10, "invalid unsigned integer")
+    Dim value As Integer
+    For Each ch As String In String.Chars(text)
+        Dim digit As Integer = String.Asc(ch) - 48
+        XLSXRequire(digit >= 0 And digit <= 9, "invalid unsigned integer")
+        XLSXRequire(value <= (maximum - digit) \ 10, "integer exceeds limit")
+        value = value * 10 + digit
+        XLSXRequire(value <= maximum, "integer exceeds limit")
+    Next
+    Return value
+End Function
+
+''' Immutable sparse cell. Coordinates are one-based; Text is the decoded raw value.
+Public Class XLSXCell
+    Private Property mRow As Integer
+    Private Property mColumn As Integer
+    Private Property mKind As String
+    Private Property mText As String
+    Private Property mFormula As String
+    Public Sub Constructor(row As Integer, column As Integer, kind As String, text As String, formula As String)
+        XLSXRequire(row >= 1 And row <= 1048576 And column >= 1 And column <= 16384, "cell coordinate out of range")
+        mRow = row
+        mColumn = column
+        mKind = kind
+        mText = text
+        mFormula = formula
+    End Sub
+    Public Property Row As Integer
+        Get
+            Return mRow
+        End Get
+    End Property
+    Public Property Column As Integer
+        Get
+            Return mColumn
+        End Get
+    End Property
+    Public Property Kind As String
+        Get
+            Return mKind
+        End Get
+    End Property
+    Public Property Text As String
+        Get
+            Return mText
+        End Get
+    End Property
+    Public Property Formula As String
+        Get
+            Return mFormula
+        End Get
+    End Property
+    Public Function NumberValue() As Double
+        XLSXRequire(ExactXLSX(mKind, "number"), "cell is not numeric")
+        Dim parsed As Result Of Double, String = Double.Parse(mText)
+        XLSXRequire(parsed.IsOk, "invalid numeric cell")
+        XLSXRequire(parsed.Value >= -1.7976931348623157e308 And parsed.Value <= 1.7976931348623157e308, "nonfinite numeric cell")
+        Return parsed.Value
+    End Function
+End Class
+
+''' Immutable sheet. Missing coordinates return None, distinct from an explicit blank cell.
+Public Class XLSXSheet
+    Private Property mName As String
+    Private Property mCells As Array Of XLSXCell
+    Private Property mIndex As Map Of Integer, XLSXCell = New Map Of Integer, XLSXCell()
+    Public Sub Constructor(name As String, cells As Array Of XLSXCell)
+        mName = name
+        mCells = Array.Clone(cells)
+        For Each cell As XLSXCell In mCells
+            XLSXRequire(Not (cell Is Nil), "Nil sheet cell")
+            Dim position As Integer = (cell.Row - 1) * 16384 + cell.Column - 1
+            XLSXRequire(Not mIndex.ContainsKey(position), "duplicate cell coordinate")
+            mIndex.Set(position, cell)
+        Next
+    End Sub
+    Public Property Name As String
+        Get
+            Return mName
+        End Get
+    End Property
+    Public Property Cells As Array Of XLSXCell
+        Get
+            Return Array.Clone(mCells)
+        End Get
+    End Property
+    Public Property CellCount As Integer
+        Get
+            Return Array.Count(mCells)
+        End Get
+    End Property
+    Public Function Cell(row As Integer, column As Integer) As Optional Of XLSXCell
+        XLSXRequire(row >= 1 And row <= 1048576 And column >= 1 And column <= 16384, "cell coordinate out of range")
+        Return mIndex.Get((row - 1) * 16384 + column - 1)
+    End Function
+End Class
+
+Public Class XLSXWorkbook
+    Private Property mSheets As Array Of XLSXSheet
+    Public Sub Constructor(sheets As Array Of XLSXSheet)
+        mSheets = Array.Clone(sheets)
+    End Sub
+    Public Property Sheets As Array Of XLSXSheet
+        Get
+            Return Array.Clone(mSheets)
+        End Get
+    End Property
+End Class
+
+Private Sub XLSXValidatePath(partPath As String)
+    XLSXRequire(String.Len(partPath) > 0 And String.Len(partPath) <= 1024, "invalid ZIP part name")
+    XLSXRequire(Not String.StartsWith(partPath, "/", True) And Not String.Contains(partPath, "\\", True) And Not String.Contains(partPath, ":", True) And Not String.Contains(partPath, "%", True), "unsupported ZIP part name")
+    For Each part As String In String.Split(partPath, "/", True)
+        XLSXRequire(Not ExactXLSX(part, "..") And Not ExactXLSX(part, "."), "ZIP traversal partPath")
+    Next
+End Sub
+
+Private Class XLSXArchive
+    Public Property Reader As ZipReader
+    Public Property Sizes As Map Of String, Integer = New Map Of String, Integer()
+    Public Property MaxPart As Integer
+    Public Property MaxTotal As Integer
+    Public Property Loaded As Integer
+    Public Function HasPart(partPath As String) As Boolean
+        Return Sizes.ContainsKey(XLSXKey(partPath))
+    End Function
+    Public Function Part(partPath As String) As XMLItem
+        XLSXRequire(Me.HasPart(partPath), "required part missing: " + partPath)
+        Dim size As Integer = Sizes.Get(XLSXKey(partPath)).Value
+        XLSXRequire(size <= MaxPart And size <= MaxTotal - Loaded, "XML part byte limit exceeded")
+        XLSXRequire(Reader.LocateEntry(partPath, False), "ZIP lookup failed")
+        Dim extracted As Optional Of Bytes = Reader.ExtractCurrentEntryToBytes()
+        XLSXRequire(extracted.HasValue, "ZIP extraction failed")
+        Dim data As Bytes = extracted.Value
+        XLSXRequire(data.Count = size And data.Count <= MaxPart, "ZIP size mismatch")
+        Loaded += data.Count
+        Dim source As String = data.ToString(Text.Encodings.UTF8)
+        XLSXRequire(Not String.Contains(source, "<!DOCTYPE", True) And Not String.Contains(source, "<!ENTITY", True), "DTDs and entities unsupported")
+        ' Restrict to UTF-8 XML so the lexical DTD guard also covers raw bytes.
+        For i As Integer = 0 To data.Count - 1
+            XLSXRequire(data.Item(i) <> 0, "UTF-16/32 XML unsupported")
+        Next
+        Dim options As New XMLParseOptions()
+        options.ExternalEntities = False
+        options.NamespaceAware = True
+        Return XML.Parse(source, options)
+    End Function
+End Class
+
+Private Function XLSXResolve(basePart As String, target As String) As String
+    XLSXRequire(String.Len(target) > 0, "relationship target missing")
+    XLSXRequire(Not String.Contains(target, "\\", True) And Not String.Contains(target, ":", True) And Not String.Contains(target, "%", True) And Not String.Contains(target, "?", True) And Not String.Contains(target, "#", True), "unsupported relationship target")
+    Dim pieces() As String
+    If Not String.StartsWith(target, "/", True) Then
+        Dim parent As Array Of String = String.Split(basePart, "/", True)
+        For i As Integer = 0 To Array.Count(parent) - 2
+            Array.Append(pieces, parent(i))
+        Next
+    End If
+    For Each piece As String In String.Split(target, "/", True)
+        If ExactXLSX(piece, "..") Then
+            XLSXRequire(Array.Count(pieces) > 0, "relationship escapes archive root")
+            Array.RemoveAt(pieces, Array.Count(pieces) - 1)
+        ElseIf Not ExactXLSX(piece, ".") And String.Len(piece) > 0 Then
+            Array.Append(pieces, piece)
+        End If
+    Next
+    Dim partPath As String = String.Join(pieces, "/")
+    XLSXValidatePath(partPath)
+    Return partPath
+End Function
+
+Private Function XLSXRelsPath(part As String) As String
+    Dim pieces As Array Of String = Array.AsResizable(String.Split(part, "/", True))
+    Dim filename As String = pieces(Array.Count(pieces) - 1)
+    Array.RemoveAt(pieces, Array.Count(pieces) - 1)
+    Array.Append(pieces, "_rels")
+    Array.Append(pieces, filename + ".rels")
+    Return String.Join(pieces, "/")
+End Function
+
+Private Function XLSXText(container As XMLItem) As String
+    Dim pieces() As String
+    For i As Integer = 0 To container.Count() - 1
+        Dim child As XMLItem = container.ChildAt(i)
+        If child.IsElement() And ExactXLSX(child.NamespaceURI(), XLSXMain) Then
+            If ExactXLSX(child.Name(), "t") Then
+                Array.Append(pieces, child.Value)
+            ElseIf ExactXLSX(child.Name(), "r") Then
+                Array.Append(pieces, XLSXChild(child, "t").Value)
+            End If
+        End If
+    Next
+    Return String.Join(pieces, "")
+End Function
+
+Private Function XLSXReadSheet(archive As XLSXArchive, partPath As String, name As String, sharedValues As Array Of String, remaining As Integer) As XLSXSheet
+    Dim root As XMLItem = XLSXRoot(archive.Part(partPath), "worksheet", XLSXMain)
+    Dim cells() As XLSXCell
+    Dim seen As New Map Of Integer, Boolean()
+    Dim data As XMLItem = XLSXChild(root, "sheetData")
+    XLSXRequire(Not data.IsNull(), "sheetData missing")
+    For i As Integer = 0 To data.Count() - 1
+        Dim rowNode As XMLItem = data.ChildAt(i)
+        If Not rowNode.IsElement() Or Not ExactXLSX(rowNode.Name(), "row") Then Continue For
+        XLSXRequire(ExactXLSX(rowNode.NamespaceURI(), XLSXMain), "unexpected row namespace")
+        Dim row As Integer = XLSXUnsigned(XLSXAttribute(rowNode, "r"), 1048576)
+        XLSXRequire(row > 0, "row number must be positive")
+        For j As Integer = 0 To rowNode.Count() - 1
+            Dim cell As XMLItem = rowNode.ChildAt(j)
+            If Not cell.IsElement() Or Not ExactXLSX(cell.Name(), "c") Then Continue For
+            XLSXRequire(ExactXLSX(cell.NamespaceURI(), XLSXMain), "unexpected cell namespace")
+            XLSXRequire(Array.Count(cells) < remaining, "cell-count limit exceeded")
+            Dim reference As String = XLSXAttribute(cell, "r")
+            Dim column As Integer
+            Dim digits As String
+            For Each ch As String In String.Chars(reference)
+                Dim code As Integer = String.Asc(ch)
+                If code >= 65 And code <= 90 And String.Len(digits) = 0 Then
+                    column = column * 26 + code - 64
+                    XLSXRequire(column <= 16384, "column exceeds XFD")
+                Else
+                    digits += ch
+                End If
+            Next
+            XLSXRequire(column > 0 And XLSXUnsigned(digits, 1048576) = row, "cell reference differs from row")
+            Dim index As Integer = (row - 1) * 16384 + column - 1
+            XLSXRequire(Not seen.ContainsKey(index), "duplicate cell coordinate")
+            seen.Set(index, True)
+            Dim kind As String = XLSXAttribute(cell, "t")
+            Dim value As String = XLSXChild(cell, "v").Value
+            Dim formulaNode As XMLItem = XLSXChild(cell, "f")
+            Dim formula As String = formulaNode.Value
+            If Not formulaNode.IsNull() Then
+                XLSXRequire(String.Len(formula) > 0, "formula text missing")
+                Dim formulaType As String = XLSXAttribute(formulaNode, "t")
+                XLSXRequire(String.Len(formulaType) = 0 Or ExactXLSX(formulaType, "normal"), "sharedValues/array/data-table formulas unsupported")
+            End If
+            If ExactXLSX(kind, "s") Then
+                Dim sharedIndex As Integer = XLSXUnsigned(value, 1000000)
+                XLSXRequire(sharedIndex < Array.Count(sharedValues), "sharedValues-string index out of range")
+                value = sharedValues(sharedIndex)
+                kind = "string"
+            ElseIf ExactXLSX(kind, "inlineStr") Then
+                value = XLSXText(XLSXChild(cell, "is"))
+                kind = "string"
+            ElseIf ExactXLSX(kind, "str") Then
+                kind = "string"
+            ElseIf ExactXLSX(kind, "b") Then
+                XLSXRequire(ExactXLSX(value, "0") Or ExactXLSX(value, "1"), "invalid boolean cell")
+                kind = "boolean"
+            ElseIf ExactXLSX(kind, "e") Then
+                kind = "error"
+            ElseIf String.Len(kind) = 0 Or ExactXLSX(kind, "n") Then
+                If String.Len(value) = 0 Then
+                    kind = "blank"
+                Else
+                    Dim number As Result Of Double, String = Double.Parse(value)
+                    XLSXRequire(number.IsOk, "invalid numeric value")
+                    XLSXRequire(number.Value >= -1.7976931348623157e308 And number.Value <= 1.7976931348623157e308, "nonfinite numeric value")
+                    kind = "number"
+                End If
+            ElseIf ExactXLSX(kind, "d") Then
+                kind = "date-text"
+            Else
+                Throw New InvalidArgumentException("XLSX: unsupported cell type")
+            End If
+            Array.Append(cells, New XLSXCell(row, column, kind, value, formula))
+        Next
+    Next
+    Return New XLSXSheet(name, cells)
+End Function
+
+''' Read transitional OOXML XLSX without extracting files or evaluating formulas.
+Public Function ReadXLSX(filePath As String, maxPartBytes As Integer = 8388608, maxTotalBytes As Integer = 33554432, maxCells As Integer = 100000, maxSheets As Integer = 128) As XLSXWorkbook
+    XLSXRequire(maxPartBytes >= 1 And maxPartBytes <= 67108864 And maxTotalBytes >= maxPartBytes And maxTotalBytes <= 268435456, "invalid byte limits")
+    XLSXRequire(maxCells >= 1 And maxCells <= 1000000 And maxSheets >= 1 And maxSheets <= 1024, "invalid model limits")
+    Dim opened As Result Of ZipReader, ZipError = ZipReader.Open(filePath)
+    XLSXRequire(opened.IsOk, "could not open ZIP archive")
+    Dim archive As New XLSXArchive()
+    archive.Reader = opened.Value
+    archive.MaxPart = maxPartBytes
+    archive.MaxTotal = maxTotalBytes
+    Try
+        Dim count As Integer
+        Dim total As Integer
+        Dim more As Boolean = archive.Reader.GotoFirstEntry()
+        While more
+            count += 1
+            XLSXRequire(count <= 4096, "ZIP entry-count limit exceeded")
+            Dim entry As ZipEntry = archive.Reader.CurrentEntry
+            XLSXValidatePath(entry.Name)
+            XLSXRequire(entry.UncompressedSize >= 0 And entry.UncompressedSize <= maxTotalBytes - total, "archive uncompressed byte limit exceeded")
+            total += entry.UncompressedSize
+            Dim key As String = XLSXKey(entry.Name)
+            XLSXRequire(Not archive.Sizes.ContainsKey(key), "duplicate ZIP entry")
+            archive.Sizes.Set(key, entry.UncompressedSize)
+            more = archive.Reader.GotoNextEntry()
+        End While
+        Dim packageRels As XMLItem = XLSXRoot(archive.Part("_rels/.rels"), "Relationships", XLSXRel)
+        XLSXValidateRelationshipIDs(packageRels)
+        Dim workbookPath As String
+        For i As Integer = 0 To packageRels.Count() - 1
+            Dim rel As XMLItem = packageRels.ChildAt(i)
+            If rel.IsElement() And ExactXLSX(XLSXAttribute(rel, "Type"), XLSXOfficeRel + "/officeDocument") Then
+                XLSXRequire(ExactXLSX(rel.Name(), "Relationship") And ExactXLSX(rel.NamespaceURI(), XLSXRel), "unexpected relationship element or namespace")
+                XLSXRequire(String.Len(workbookPath) = 0 And Not ExactXLSX(XLSXAttribute(rel, "TargetMode"), "External"), "ambiguous/external workbook relationship")
+                workbookPath = XLSXResolve("", XLSXAttribute(rel, "Target"))
+            End If
+        Next
+        XLSXRequire(String.Len(workbookPath) > 0, "officeDocument relationship missing")
+        Dim workbook As XMLItem = XLSXRoot(archive.Part(workbookPath), "workbook", XLSXMain)
+        Dim relationships As XMLItem = XLSXRoot(archive.Part(XLSXRelsPath(workbookPath)), "Relationships", XLSXRel)
+        XLSXValidateRelationshipIDs(relationships)
+        Dim worksheets As New Map Of String, String()
+        Dim sharedPath As String
+        For i As Integer = 0 To relationships.Count() - 1
+            Dim rel As XMLItem = relationships.ChildAt(i)
+            If Not rel.IsElement() Then Continue For
+            Dim typeName As String = XLSXAttribute(rel, "Type")
+            If ExactXLSX(typeName, XLSXOfficeRel + "/worksheet") Or ExactXLSX(typeName, XLSXOfficeRel + "/sharedStrings") Then
+                XLSXRequire(ExactXLSX(rel.Name(), "Relationship") And ExactXLSX(rel.NamespaceURI(), XLSXRel), "unexpected relationship element or namespace")
+                XLSXRequire(Not ExactXLSX(XLSXAttribute(rel, "TargetMode"), "External"), "external sheet/sharedValues-string relationship unsupported")
+                Dim target As String = XLSXResolve(workbookPath, XLSXAttribute(rel, "Target"))
+                If ExactXLSX(typeName, XLSXOfficeRel + "/sharedStrings") Then
+                    XLSXRequire(String.Len(sharedPath) = 0, "duplicate sharedValues-string relationship")
+                    sharedPath = target
+                Else
+                    Dim id As String = XLSXAttribute(rel, "Id")
+                    XLSXRequire(String.Len(id) > 0 And Not worksheets.ContainsKey(XLSXKey(id)), "duplicate/missing relationship ID")
+                    worksheets.Set(XLSXKey(id), target)
+                End If
+            End If
+        Next
+        Dim sharedValues() As String
+        If String.Len(sharedPath) > 0 Then
+            Dim strings As XMLItem = XLSXRoot(archive.Part(sharedPath), "sst", XLSXMain)
+            For i As Integer = 0 To strings.Count() - 1
+                Dim item As XMLItem = strings.ChildAt(i)
+                If item.IsElement() And ExactXLSX(item.Name(), "si") Then
+                    XLSXRequire(ExactXLSX(item.NamespaceURI(), XLSXMain), "unexpected shared string namespace")
+                    XLSXRequire(Array.Count(sharedValues) < maxCells, "sharedValues-string count limit exceeded")
+                    Array.Append(sharedValues, XLSXText(item))
+                End If
+            Next
+        End If
+        Dim resultSheets() As XLSXSheet
+        Dim names As New Map Of String, Integer()
+        Dim cellCount As Integer
+        Dim sheets As XMLItem = XLSXChild(workbook, "sheets")
+        XLSXRequire(Not sheets.IsNull(), "workbook sheets missing")
+        For i As Integer = 0 To sheets.Count() - 1
+            Dim item As XMLItem = sheets.ChildAt(i)
+            If Not item.IsElement() Or Not ExactXLSX(item.Name(), "sheet") Then Continue For
+            XLSXRequire(ExactXLSX(item.NamespaceURI(), XLSXMain), "unexpected sheet namespace")
+            XLSXRequire(Array.Count(resultSheets) < maxSheets, "sheet-count limit exceeded")
+            Dim name As String = XLSXAttribute(item, "name")
+            XLSXRequire(String.Len(name) > 0 And Not names.ContainsKey(XLSXKey(name)), "duplicate/missing sheet name")
+            names.Set(XLSXKey(name), 1)
+            Dim id As String = item.AttributeNS("id", XLSXOfficeRel).Or("")
+            XLSXRequire(worksheets.ContainsKey(XLSXKey(id)), "sheet relationship missing")
+            Dim sheet As XLSXSheet = XLSXReadSheet(archive, worksheets.Get(XLSXKey(id)).Value, name, sharedValues, maxCells - cellCount)
+            cellCount += sheet.CellCount
+            Array.Append(resultSheets, sheet)
+        Next
+        XLSXRequire(Array.Count(resultSheets) > 0, "workbook has no worksheets")
+        Return New XLSXWorkbook(resultSheets)
+    Finally
+        archive.Reader.Close()
+    End Try
+End Function
