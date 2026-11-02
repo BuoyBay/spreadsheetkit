@@ -1,4 +1,4 @@
-# XLSX → sparse typed cells
+# Sparse XLSX cells
 
 A read-only XLSX workbook package for importers, table viewers and conversion
 utilities. `Import spreadsheetkit` uses the bundled `zip.Zip` and `xml.XML`
