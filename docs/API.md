@@ -79,7 +79,4 @@ packages/spreadsheetkit-0.1.0.buipkg`. Consumers need the installed ZIP and XML
 archives in their `packages/` directory as well. On this host those are
 `zip-4.0.7.buipkg` and `xml-1.0.0.buipkg` under `/usr/share/buoy/packages`.
 
-Maintainers run the private validation suite before release. See the repository README for public build instructions.
-
-See [provenance](../PROVENANCE.md) and the
-console example (not included in this repository).
+See [provenance](../PROVENANCE.md) and the [console importer](../examples/library-studies/impact/spreadsheets/main.bui).
